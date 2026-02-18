@@ -4,18 +4,19 @@ import (
 	"fiber-poc-api/database/entity"
 	internal "fiber-poc-api/routes"
 	"fmt"
+	"strings"
+	"time"
+
+	jwtware "github.com/gofiber/contrib/jwt"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/log"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	jwtware "github.com/gofiber/jwt/v3"
-	_ "github.com/jackc/pgx/v4/stdlib"
+
 	"github.com/spf13/viper"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
-	"strings"
-	"time"
 )
 
 func main() {
@@ -30,40 +31,54 @@ func main() {
 		log.Errorf("fatal error config file: %+v \n", err)
 	}
 
-	// ==> Connect database mysql
+	// ==> Connect database (PostgreSQL)
 	db := databaseConnection()
-	generateTable := true
-	log.Infof("config generateTable: %t", generateTable)
-	if generateTable {
-		db.AutoMigrate(&entity.User{})
-		db.AutoMigrate(&entity.Role{})
-		db.AutoMigrate(&entity.Privilege{})
-		db.AutoMigrate(&entity.UserRole{})
-		db.AutoMigrate(&entity.RolePrivilege{})
-		db.AutoMigrate(&entity.LoginHistory{})
-		log.Infof("Generate Tables success")
+
+	// ควรเช็ค nil ก่อนใช้งาน db ต่อ
+	if db != nil {
+		generateTable := true
+		log.Infof("config generateTable: %t", generateTable)
+		if generateTable {
+			// AutoMigrate คืนค่า error ด้วย ควร handle หรือ log ไว้
+			if err := db.AutoMigrate(
+				&entity.User{},
+				&entity.Role{},
+				&entity.Privilege{},
+				&entity.UserRole{},
+				&entity.RolePrivilege{},
+				&entity.LoginHistory{},
+			); err != nil {
+				log.Errorf("Migration failed: %v", err)
+			} else {
+				log.Infof("Generate Tables success")
+			}
+		}
 	}
 
 	app := fiber.New()
 
-	// ==> cors
-	app.Use(cors.New())
+	// ==> cors (รวมเหลืออันเดียว และเพิ่ม Authorization)
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 	}))
 
-	// ==> JWT Middleware configuration
+	// ==> JWT Middleware configuration (Updated for contrib/jwt)
 	jwtMiddleware := jwtware.New(jwtware.Config{
-		SigningKey:   []byte(viper.GetString("jwt.secret")),
+		// Syntax ใหม่ของ contrib/jwt ต้องระบุ Key ใน Struct
+		SigningKey: jwtware.SigningKey{
+			Key: []byte(viper.GetString("jwt.secret")),
+		},
 		ErrorHandler: jwtError,
 	})
 
 	// ==> routes
+	// หมายเหตุ: ตรวจสอบว่าใน internal.Router รับ parameter เป็น fiber.Handler หรือไม่
 	internal.Router(app, jwtMiddleware, db)
 
 	// ==> server start
 	port := viper.GetString("server.port")
+	log.Infof("Server is starting on port: %s", port)
 	err = app.Listen(fmt.Sprintf(":%s", port))
 	if err != nil {
 		log.Errorf("error server: %+v \n", err.Error())
@@ -72,15 +87,22 @@ func main() {
 }
 
 func jwtError(c *fiber.Ctx, err error) error {
+	// เพิ่มการ Log error เพื่อให้ Debug ง่ายขึ้นว่าทำไม Unauthorized (เช่น Token Expired หรือ Signature ผิด)
 	if err != nil {
-		return c.Status(fiber.StatusUnauthorized).SendString("Unauthorized")
+		log.Warnf("JWT Error: %v", err)
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"status":  "error",
+			"message": "Unauthorized: " + err.Error(),
+		})
 	}
 	return c.Next()
 }
 
 func databaseConnection() *gorm.DB {
 
-	newLogger := logger.New(nil,
+	newLogger := logger.New(
+		// ใช้ Standard Log Writer แทน nil (เพื่อให้ log ออกมาที่ console ได้ถ้าต้องการ)
+		nil,
 		logger.Config{
 			SlowThreshold:             time.Second,   // Slow SQL threshold
 			LogLevel:                  logger.Silent, // Log level
@@ -102,7 +124,7 @@ func databaseConnection() *gorm.DB {
 		Logger: newLogger,
 		NamingStrategy: schema.NamingStrategy{
 			TablePrefix: "",
-			NoLowerCase: true,
+			NoLowerCase: true, // ระวัง: PostgreSQL ชอบ table name ตัวเล็ก (lowercase) การใช้ NoLowerCase อาจมีปัญหากับ Convention ทั่วไปของ PG
 		},
 	})
 	if err != nil {
